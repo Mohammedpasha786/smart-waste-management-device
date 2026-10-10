@@ -1,0 +1,45 @@
+import json
+import os
+import random
+import time
+import urllib.request
+
+BASE = os.getenv("WASTE_URL", "http://localhost:8000")
+KEY = os.getenv("WASTE_API_KEY", "change-me")
+
+BINS = [
+    ("BIN-01", "Main Gate", 17.9689, 79.5941, "dry"),
+    ("BIN-02", "Library", 17.9702, 79.5958, "dry"),
+    ("BIN-03", "Canteen", 17.9675, 79.5972, "wet"),
+    ("BIN-04", "Hostel A", 17.9660, 79.5930, "mixed"),
+    ("BIN-05", "Auditorium", 17.9710, 79.5925, "dry"),
+    ("BIN-06", "Sports Ground", 17.9695, 79.5990, "wet"),
+]
+
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        BASE + path, method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Content-Type": "application/json", "X-API-Key": KEY})
+    with urllib.request.urlopen(req) as r:
+        return json.load(r)
+
+def main():
+    for bid, name, lat, lng, wt in BINS:
+        call("POST", "/api/bins", {"id": bid, "name": name, "lat": lat, "lng": lng, "waste_type": wt})
+    call("POST", "/api/cards", {"uid": "A1B2C3D4", "holder": "Sanitation Worker 1"})
+    fill = {b[0]: random.uniform(10, 85) for b in BINS}
+    battery = {b[0]: random.uniform(60, 100) for b in BINS}
+    while True:
+        for bid in fill:
+            fill[bid] = min(100, fill[bid] + random.uniform(0, 4))
+            battery[bid] = max(0, battery[bid] - random.uniform(0, 0.2))
+            call("POST", "/api/readings", {
+                "bin_id": bid, "fill_pct": round(fill[bid], 1),
+                "weight_kg": round(fill[bid] * 0.4, 1), "battery_pct": round(battery[bid], 1)})
+        print("sent readings")
+        time.sleep(5)
+
+if __name__ == "__main__":
+    main()
+
