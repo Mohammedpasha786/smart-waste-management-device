@@ -1,0 +1,44 @@
+CREATE TABLE IF NOT EXISTS bins(
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    lat REAL,
+    lng REAL,
+    waste_type TEXT DEFAULT 'dry',
+    capacity_kg REAL DEFAULT 50,
+    fill_pct REAL DEFAULT 0,
+    weight_kg REAL DEFAULT 0,
+    battery_pct REAL DEFAULT 100,
+    last_seen REAL DEFAULT 0,
+    last_collected REAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS readings(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bin_id TEXT,
+    ts REAL,
+    fill_pct REAL,
+    weight_kg REAL,
+    battery_pct REAL
+);
+CREATE TABLE IF NOT EXISTS cards(
+    uid TEXT PRIMARY KEY,
+    holder TEXT,
+    role TEXT,
+    active INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS access_log(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL,
+    bin_id TEXT,
+    uid TEXT,
+    holder TEXT,
+    granted INTEGER
+);
+CREATE TABLE IF NOT EXISTS collections(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL,
+    bin_id TEXT,
+    weight_kg REAL,
+    collected_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_readings_bin_ts ON readings(bin_id, ts);
+CREATE INDEX IF NOT EXISTS idx_access_ts ON access_log(ts);
