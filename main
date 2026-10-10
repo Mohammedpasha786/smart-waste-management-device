@@ -1,0 +1,233 @@
+import os
+import sqlite3
+import time
+from contextlib import contextmanager
+from typing import Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from routing import baseline_distance, optimise
+
+DB_PATH = os.getenv("WASTE_DB", "waste.db")
+API_KEY = os.getenv("WASTE_API_KEY", "change-me")
+DEPOT = (float(os.getenv("DEPOT_LAT", "17.9689")), float(os.getenv("DEPOT_LNG", "79.5941")))
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+app = FastAPI(title="Smart Waste Management", version="1.0.0")
+
+@contextmanager
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        yield con
+        con.commit()
+    finally:
+        con.close()
+
+def init_db():
+    with db() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS bins(
+            id TEXT PRIMARY KEY, name TEXT, lat REAL, lng REAL,
+            waste_type TEXT DEFAULT 'dry', capacity_kg REAL DEFAULT 50,
+            fill_pct REAL DEFAULT 0, weight_kg REAL DEFAULT 0,
+            battery_pct REAL DEFAULT 100, last_seen REAL DEFAULT 0,
+            last_collected REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS readings(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, bin_id TEXT, ts REAL,
+            fill_pct REAL, weight_kg REAL, battery_pct REAL);
+        CREATE TABLE IF NOT EXISTS cards(
+            uid TEXT PRIMARY KEY, holder TEXT, role TEXT, active INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS access_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, bin_id TEXT,
+            uid TEXT, holder TEXT, granted INTEGER);
+        CREATE TABLE IF NOT EXISTS collections(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, bin_id TEXT,
+            weight_kg REAL, collected_by TEXT);
+        """)
+
+init_db()
+
+def require_key(x_api_key: Optional[str] = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "invalid api key")
+
+class BinIn(BaseModel):
+    id: str
+    name: str
+    lat: float
+    lng: float
+    waste_type: str = Field("dry", pattern="^(dry|wet|mixed)$")
+    capacity_kg: float = 50
+
+class ReadingIn(BaseModel):
+    bin_id: str
+    fill_pct: float = Field(ge=0, le=100)
+    weight_kg: float = Field(0, ge=0)
+    battery_pct: float = Field(100, ge=0, le=100)
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class CardIn(BaseModel):
+    uid: str
+    holder: str
+    role: str = "collector"
+
+class VerifyIn(BaseModel):
+    uid: str
+    bin_id: str
+
+class CollectIn(BaseModel):
+    collected_by: str = "unknown"
+
+def status_of(row):
+    d = dict(row)
+    f = d["fill_pct"]
+    d["status"] = "critical" if f >= 90 else "warning" if f >= 70 else "ok"
+    d["offline"] = d["last_seen"] > 0 and time.time() - d["last_seen"] > 900
+    return d
+
+@app.post("/api/bins", dependencies=[Depends(require_key)])
+def create_bin(b: BinIn):
+    with db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO bins(id,name,lat,lng,waste_type,capacity_kg) VALUES(?,?,?,?,?,?)",
+            (b.id, b.name, b.lat, b.lng, b.waste_type, b.capacity_kg))
+    return {"ok": True}
+
+@app.get("/api/bins")
+def list_bins():
+    with db() as con:
+        return [status_of(r) for r in con.execute("SELECT * FROM bins ORDER BY id")]
+
+@app.post("/api/readings", dependencies=[Depends(require_key)])
+def post_reading(r: ReadingIn):
+    now = time.time()
+    with db() as con:
+        if not con.execute("SELECT 1 FROM bins WHERE id=?", (r.bin_id,)).fetchone():
+            raise HTTPException(404, "unknown bin")
+        con.execute(
+            "UPDATE bins SET fill_pct=?,weight_kg=?,battery_pct=?,last_seen=?,"
+            "lat=COALESCE(?,lat),lng=COALESCE(?,lng) WHERE id=?",
+            (r.fill_pct, r.weight_kg, r.battery_pct, now, r.lat, r.lng, r.bin_id))
+        con.execute(
+            "INSERT INTO readings(bin_id,ts,fill_pct,weight_kg,battery_pct) VALUES(?,?,?,?,?)",
+            (r.bin_id, now, r.fill_pct, r.weight_kg, r.battery_pct))
+    return {"ok": True}
+
+@app.get("/api/bins/{bin_id}/history")
+def history(bin_id: str, limit: int = 200):
+    with db() as con:
+        rows = con.execute(
+            "SELECT ts,fill_pct,weight_kg FROM readings WHERE bin_id=? ORDER BY ts DESC LIMIT ?",
+            (bin_id, limit)).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+@app.post("/api/bins/{bin_id}/collect")
+def collect(bin_id: str, c: CollectIn):
+    now = time.time()
+    with db() as con:
+        row = con.execute("SELECT weight_kg FROM bins WHERE id=?", (bin_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "unknown bin")
+        con.execute(
+            "INSERT INTO collections(ts,bin_id,weight_kg,collected_by) VALUES(?,?,?,?)",
+            (now, bin_id, row["weight_kg"], c.collected_by))
+        con.execute(
+            "UPDATE bins SET fill_pct=0,weight_kg=0,last_collected=? WHERE id=?", (now, bin_id))
+    return {"ok": True}
+
+@app.post("/api/cards", dependencies=[Depends(require_key)])
+def add_card(c: CardIn):
+    with db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO cards(uid,holder,role,active) VALUES(?,?,?,1)",
+            (c.uid.upper(), c.holder, c.role))
+    return {"ok": True}
+
+@app.delete("/api/cards/{uid}", dependencies=[Depends(require_key)])
+def revoke_card(uid: str):
+    with db() as con:
+        con.execute("UPDATE cards SET active=0 WHERE uid=?", (uid.upper(),))
+    return {"ok": True}
+
+@app.post("/api/rfid/verify", dependencies=[Depends(require_key)])
+def verify(v: VerifyIn):
+    with db() as con:
+        card = con.execute(
+            "SELECT * FROM cards WHERE uid=? AND active=1", (v.uid.upper(),)).fetchone()
+        granted = card is not None
+        con.execute(
+            "INSERT INTO access_log(ts,bin_id,uid,holder,granted) VALUES(?,?,?,?,?)",
+            (time.time(), v.bin_id, v.uid.upper(), card["holder"] if card else None, int(granted)))
+    return {"granted": granted, "holder": card["holder"] if card else None}
+
+@app.get("/api/access-log")
+def access_log(limit: int = 50):
+    with db() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM access_log ORDER BY ts DESC LIMIT ?", (limit,))]
+
+@app.get("/api/route")
+def route(threshold: float = 70, truck_capacity_kg: Optional[float] = None,
+          depot_lat: float = DEPOT[0], depot_lng: float = DEPOT[1]):
+    with db() as con:
+        all_bins = [dict(r) for r in con.execute("SELECT * FROM bins")]
+    due = [b for b in all_bins if b["fill_pct"] >= threshold]
+    depot = (depot_lat, depot_lng)
+    plan = optimise(depot, due, truck_capacity_kg)
+    fixed = baseline_distance(depot, all_bins)
+    saved = round(max(0.0, 1 - plan["distance_km"] / fixed) * 100, 1) if fixed else 0.0
+    return {
+        "depot": {"lat": depot[0], "lng": depot[1]},
+        "stops": plan["stops"],
+        "distance_km": plan["distance_km"],
+        "fixed_schedule_km": fixed,
+        "distance_saved_pct": saved,
+        "bins_skipped": len(all_bins) - len(plan["stops"]),
+    }
+
+@app.get("/api/alerts")
+def alerts():
+    out = []
+    with db() as con:
+        for r in con.execute("SELECT * FROM bins"):
+            b = status_of(r)
+            if b["status"] != "ok":
+                out.append({"bin_id": b["id"], "name": b["name"], "level": b["status"],
+                            "message": f"{b['name']} is {b['fill_pct']:.0f}% full"})
+            if b["battery_pct"] < 20:
+                out.append({"bin_id": b["id"], "name": b["name"], "level": "warning",
+                            "message": f"{b['name']} battery low ({b['battery_pct']:.0f}%)"})
+            if b["offline"]:
+                out.append({"bin_id": b["id"], "name": b["name"], "level": "critical",
+                            "message": f"{b['name']} is offline"})
+    return out
+
+@app.get("/api/stats")
+def stats():
+    with db() as con:
+        bins = [dict(r) for r in con.execute("SELECT fill_pct,weight_kg FROM bins")]
+        collected = con.execute(
+            "SELECT COUNT(*) c, COALESCE(SUM(weight_kg),0) w FROM collections").fetchone()
+    n = len(bins)
+    return {
+        "bins": n,
+        "avg_fill_pct": round(sum(b["fill_pct"] for b in bins) / n, 1) if n else 0,
+        "critical": sum(b["fill_pct"] >= 90 for b in bins),
+        "warning": sum(70 <= b["fill_pct"] < 90 for b in bins),
+        "total_weight_kg": round(sum(b["weight_kg"] for b in bins), 1),
+        "collections": collected["c"],
+        "collected_kg": round(collected["w"], 1),
+    }
+
+@app.get("/")
+def index():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
