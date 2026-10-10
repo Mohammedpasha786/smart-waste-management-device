@@ -1,0 +1,155 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <HX711.h>
+#include <ArduinoJson.h>
+#include "config.h"
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define HX_DOUT 16
+#define HX_SCK 17
+#define RST_PIN 22
+#define SS_PIN 21
+#define LOCK_PIN 27
+#define LED_GREEN 25
+#define LED_RED 26
+#define BUZZER 33
+#define BAT_PIN 34
+#define CALIBRATION_FACTOR 21000.0
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+HX711 scale;
+unsigned long lastReport = 0;
+unsigned long unlockUntil = 0;
+
+void connectWifi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) delay(300);
+}
+
+float readDistanceCm() {
+  float sum = 0;
+  int n = 0;
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    long d = pulseIn(ECHO_PIN, HIGH, 30000);
+    if (d > 0) {
+      sum += d * 0.0343 / 2.0;
+      n++;
+    }
+    delay(30);
+  }
+  return n ? sum / n : BIN_HEIGHT_CM;
+}
+
+float fillPercent() {
+  float d = constrain(readDistanceCm(), 0, BIN_HEIGHT_CM);
+  return (1.0 - d / BIN_HEIGHT_CM) * 100.0;
+}
+
+float batteryPercent() {
+  float v = analogRead(BAT_PIN) / 4095.0 * 3.3 * 2.0;
+  return constrain((v - 3.3) / (4.2 - 3.3) * 100.0, 0, 100);
+}
+
+bool post(const String &path, const String &body, String &response) {
+  connectWifi();
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.begin(String(SERVER_URL) + path);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", API_KEY);
+  int code = http.POST(body);
+  if (code > 0) response = http.getString();
+  http.end();
+  return code == 200;
+}
+
+void report() {
+  StaticJsonDocument<256> doc;
+  doc["bin_id"] = BIN_ID;
+  doc["fill_pct"] = round(fillPercent() * 10) / 10.0;
+  doc["weight_kg"] = max(0.0f, scale.get_units(5));
+  doc["battery_pct"] = round(batteryPercent());
+  doc["lat"] = BIN_LAT;
+  doc["lng"] = BIN_LNG;
+  String body, res;
+  serializeJson(doc, body);
+  post("/api/readings", body, res);
+  if (doc["fill_pct"].as<float>() >= 90) {
+    tone(BUZZER, 2000, 300);
+    digitalWrite(LED_RED, HIGH);
+  } else {
+    digitalWrite(LED_RED, LOW);
+  }
+}
+
+String cardUid() {
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+void handleCard() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+  StaticJsonDocument<128> doc;
+  doc["uid"] = cardUid();
+  doc["bin_id"] = BIN_ID;
+  String body, res;
+  serializeJson(doc, body);
+  bool ok = post("/api/rfid/verify", body, res);
+  StaticJsonDocument<128> out;
+  bool granted = ok && !deserializeJson(out, res) && out["granted"].as<bool>();
+  if (granted) {
+    digitalWrite(LOCK_PIN, HIGH);
+    digitalWrite(LED_GREEN, HIGH);
+    unlockUntil = millis() + 10000;
+  } else {
+    tone(BUZZER, 400, 600);
+  }
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LOCK_PIN, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  SPI.begin();
+  rfid.PCD_Init();
+  scale.begin(HX_DOUT, HX_SCK);
+  scale.set_scale(CALIBRATION_FACTOR);
+  scale.tare();
+  connectWifi();
+  report();
+}
+
+void loop() {
+  handleCard();
+  if (unlockUntil && millis() > unlockUntil) {
+    digitalWrite(LOCK_PIN, LOW);
+    digitalWrite(LED_GREEN, LOW);
+    unlockUntil = 0;
+  }
+  if (millis() - lastReport >= REPORT_INTERVAL_MS) {
+    lastReport = millis();
+    report();
+  }
+  delay(50);
+}
+
